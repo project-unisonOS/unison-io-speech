@@ -1,0 +1,29 @@
+name: unison-io-speech Docker CI
+
+on:
+  pull_request:
+    paths:
+      - 'unison-io-speech/**'
+      - '.github/workflows/docker-ci.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'unison-io-speech/**'
+      - '.github/workflows/docker-ci.yml'
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./unison-io-speech
+          push: false
+          tags: unison-io-speech:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

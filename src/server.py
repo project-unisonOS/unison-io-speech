@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, WebSocket
 import uvicorn
 import logging
 import json
@@ -8,6 +8,9 @@ from typing import Any, Dict
 from unison_common.logging import configure_logging, log_json
 from collections import defaultdict
 
+# Import WebSocket handler
+from websocket_handler import handle_websocket_stream, get_active_sessions, get_session_count
+
 app = FastAPI(title="unison-io-speech")
 
 logger = configure_logging("unison-io-speech")
@@ -16,6 +19,7 @@ logger = configure_logging("unison-io-speech")
 _metrics = defaultdict(int)
 _start_time = time.time()
 
+@app.get("/healthz")
 @app.get("/health")
 def health(request: Request):
     _metrics["/health"] += 1
@@ -41,6 +45,7 @@ def metrics():
     ])
     return "\n".join(lines)
 
+@app.get("/readyz")
 @app.get("/ready")
 def ready(request: Request):
     event_id = request.headers.get("X-Event-ID")
@@ -79,6 +84,34 @@ def text_to_speech(request: Request, body: Dict[str, Any] = Body(...)):
     audio_url = f"data:audio/wav;base64,{silence_wav}"
     log_json(logging.INFO, "tts", service="unison-io-speech", event_id=event_id, text_len=len(text))
     return {"ok": True, "audio_url": audio_url, "event_id": event_id}
+
+@app.websocket("/stream")
+async def websocket_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time audio streaming.
+    
+    Supports:
+    - Bidirectional audio streaming
+    - Voice Activity Detection (VAD)
+    - Streaming transcription
+    - Barge-in support
+    """
+    _metrics["/stream"] += 1
+    await handle_websocket_stream(websocket)
+
+@app.get("/sessions")
+def get_sessions(request: Request):
+    """Get information about active WebSocket sessions"""
+    _metrics["/sessions"] += 1
+    event_id = request.headers.get("X-Event-ID")
+    sessions = get_active_sessions()
+    log_json(logging.INFO, "sessions", service="unison-io-speech", event_id=event_id, count=len(sessions))
+    return {
+        "ok": True,
+        "count": get_session_count(),
+        "sessions": sessions,
+        "event_id": event_id
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8084)

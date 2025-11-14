@@ -6,14 +6,22 @@ import time
 import base64
 from typing import Any, Dict
 from unison_common.logging import configure_logging, log_json
+from unison_common.tracing_middleware import TracingMiddleware
+from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
 from collections import defaultdict
 
 # Import WebSocket handler
 from websocket_handler import handle_websocket_stream, get_active_sessions, get_session_count
 
 app = FastAPI(title="unison-io-speech")
+app.add_middleware(TracingMiddleware, service_name="unison-io-speech")
 
 logger = configure_logging("unison-io-speech")
+
+# P0.3: Initialize tracing and instrument FastAPI/httpx
+initialize_tracing()
+instrument_fastapi(app)
+instrument_httpx()
 
 # Simple in-memory metrics
 _metrics = defaultdict(int)

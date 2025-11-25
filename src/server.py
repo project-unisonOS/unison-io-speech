@@ -8,13 +8,19 @@ from typing import Any, Dict
 from unison_common.logging import configure_logging, log_json
 from unison_common.tracing_middleware import TracingMiddleware
 from unison_common.tracing import initialize_tracing, instrument_fastapi, instrument_httpx
+try:
+    from unison_common import BatonMiddleware
+except Exception:
+    BatonMiddleware = None
 from collections import defaultdict
 
 # Import WebSocket handler
-from websocket_handler import handle_websocket_stream, get_active_sessions, get_session_count
+from .websocket_handler import handle_websocket_stream, get_active_sessions, get_session_count
 
 app = FastAPI(title="unison-io-speech")
 app.add_middleware(TracingMiddleware, service_name="unison-io-speech")
+if BatonMiddleware:
+    app.add_middleware(BatonMiddleware)
 
 logger = configure_logging("unison-io-speech")
 
@@ -68,13 +74,32 @@ def speech_to_text(request: Request, body: Dict[str, Any] = Body(...)):
     """
     _metrics["/speech/stt"] += 1
     event_id = request.headers.get("X-Event-ID")
+    baton = request.headers.get("X-Context-Baton")
     audio_b64 = body.get("audio")
+    person_id = body.get("person_id")
+    session_id = body.get("session_id")
     if not isinstance(audio_b64, str):
         return {"ok": False, "error": "missing or invalid 'audio' field (base64 string)", "event_id": event_id}
     # MVP: ignore audio, return a placeholder transcript
     transcript = "This is a placeholder transcript from speech-to-text."
-    log_json(logging.INFO, "stt", service="unison-io-speech", event_id=event_id, transcript_len=len(transcript))
-    return {"ok": True, "transcript": transcript, "event_id": event_id}
+    log_json(
+        logging.INFO,
+        "stt",
+        service="unison-io-speech",
+        event_id=event_id,
+        transcript_len=len(transcript),
+        person_id=person_id,
+        session_id=session_id,
+    )
+    return {
+        "ok": True,
+        "transcript": transcript,
+        "event_id": event_id,
+        "person_id": person_id,
+        "session_id": session_id,
+        "baton": baton,
+        "received_at": time.time(),
+    }
 
 @app.post("/speech/tts")
 def text_to_speech(request: Request, body: Dict[str, Any] = Body(...)):
@@ -84,14 +109,33 @@ def text_to_speech(request: Request, body: Dict[str, Any] = Body(...)):
     """
     _metrics["/speech/tts"] += 1
     event_id = request.headers.get("X-Event-ID")
+    baton = request.headers.get("X-Context-Baton")
     text = body.get("text")
+    person_id = body.get("person_id")
+    session_id = body.get("session_id")
     if not isinstance(text, str) or not text:
         return {"ok": False, "error": "missing or invalid 'text' field", "event_id": event_id}
     # MVP: return a placeholder base64-encoded WAV (tiny silence)
     silence_wav = "UklGRigAAABXQVZFZm10IBAAAAAAQAEAAEAfAAAQAQABAAgAZGF0YQQAAAA="
     audio_url = f"data:audio/wav;base64,{silence_wav}"
-    log_json(logging.INFO, "tts", service="unison-io-speech", event_id=event_id, text_len=len(text))
-    return {"ok": True, "audio_url": audio_url, "event_id": event_id}
+    log_json(
+        logging.INFO,
+        "tts",
+        service="unison-io-speech",
+        event_id=event_id,
+        text_len=len(text),
+        person_id=person_id,
+        session_id=session_id,
+    )
+    return {
+        "ok": True,
+        "audio_url": audio_url,
+        "event_id": event_id,
+        "person_id": person_id,
+        "session_id": session_id,
+        "baton": baton,
+        "received_at": time.time(),
+    }
 
 @app.websocket("/stream")
 async def websocket_stream(websocket: WebSocket):

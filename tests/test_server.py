@@ -1,11 +1,13 @@
 import sys
 import os
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+# Add project root to path so we can import the package form
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from fastapi.testclient import TestClient
-from server import app
+from src.server import app
 
 client = TestClient(app)
 

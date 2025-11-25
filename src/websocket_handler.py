@@ -8,11 +8,11 @@ import asyncio
 import base64
 import json
 import logging
-from typing import Optional
+from typing import Optional, Any
 from fastapi import WebSocket, WebSocketDisconnect
 from datetime import datetime
 
-from message_schema import (
+from .message_schema import (
     parse_client_message,
     create_transcript_message,
     create_vad_event,
@@ -22,7 +22,7 @@ from message_schema import (
     AudioInputMessage,
     ControlMessage,
 )
-from vad import VoiceActivityDetector, VADConfig
+from .vad import VoiceActivityDetector, VADConfig
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +34,15 @@ class StreamingSession:
     Handles audio input, VAD, transcription, and barge-in.
     """
     
-    def __init__(self, websocket: WebSocket, session_id: str):
+    def __init__(self, session_id: str, websocket: Optional[WebSocket] = None):
         self.websocket = websocket
         self.session_id = session_id
         self.vad = VoiceActivityDetector(VADConfig())
+        self.is_active = True
         self.is_listening = False
         self.is_speaking = False  # TTS playback state
-        self.audio_buffer = bytearray()
+        self.audio_buffer: bytes = b""
+        self.transcript_buffer: str = ""
         self.sequence_counter = 0
         self.tts_sequence: Optional[int] = None
         self.start_time = datetime.now()
@@ -49,11 +51,25 @@ class StreamingSession:
     
     async def send_message(self, message: dict):
         """Send message to client"""
+        if not self.websocket:
+            return
         try:
             await self.websocket.send_json(message)
         except Exception as e:
             logger.error(f"Session {self.session_id}: Error sending message: {e}")
             raise
+
+    def add_audio(self, data: bytes):
+        """Test helper: append audio bytes to buffer."""
+        self.audio_buffer += data
+
+    def clear_buffer(self):
+        """Test helper: clear audio buffer."""
+        self.audio_buffer = b""
+
+    def deactivate(self):
+        """Mark session inactive."""
+        self.is_active = False
     
     async def handle_audio_input(self, message: AudioInputMessage):
         """
@@ -66,7 +82,7 @@ class StreamingSession:
             audio_bytes = base64.b64decode(message.data)
             
             # Add to buffer
-            self.audio_buffer.extend(audio_bytes)
+            self.audio_buffer += audio_bytes
             
             # Process through VAD
             vad_events = self.vad.process_chunk(audio_bytes, format="pcm16")
@@ -219,6 +235,64 @@ class StreamingSession:
             "uptime_seconds": (datetime.now() - self.start_time).total_seconds(),
         }
 
+# Lightweight handler used by unit tests to manage sessions without FastAPI.
+class WebSocketHandler:
+    def __init__(self):
+        self.active_sessions: dict[str, StreamingSession] = {}
+        self.session_counter = 0
+        self.vad = VoiceActivityDetector(VADConfig())
+
+    def create_session(self) -> str:
+        self.session_counter += 1
+        session_id = f"session-{self.session_counter}"
+        self.active_sessions[session_id] = StreamingSession(session_id)
+        return session_id
+
+    def get_session(self, session_id: str) -> Optional[StreamingSession]:
+        return self.active_sessions.get(session_id)
+
+    def close_session(self, session_id: str) -> None:
+        self.active_sessions.pop(session_id, None)
+
+    async def handle_message(self, websocket: Any, message: dict, session_id: str) -> None:
+        """Minimal message router used by tests."""
+        session = self.active_sessions.get(session_id)
+        if session is None:
+            session = StreamingSession(session_id, websocket if isinstance(websocket, WebSocket) else None)
+            self.active_sessions[session_id] = session
+        if websocket and session.websocket is None:
+            session.websocket = websocket
+
+        msg_type = message.get("type")
+        try:
+            if msg_type == "audio_chunk":
+                audio_b64 = message.get("audio") or ""
+                try:
+                    audio_bytes = base64.b64decode(audio_b64)
+                    session.add_audio(audio_bytes)
+                    if websocket:
+                        await websocket.send_json({"type": "audio_ack", "sequence": message.get("sequence")})
+                except Exception:
+                    if websocket:
+                        await websocket.send_json({"type": "error", "message": "invalid audio"})
+            elif msg_type == "start_stream":
+                if websocket:
+                    await websocket.send_json({"type": "ready", "session_id": session_id})
+            elif msg_type == "end_stream":
+                session.deactivate()
+                if websocket:
+                    await websocket.send_json({"type": "end", "session_id": session_id})
+            elif msg_type == "cancel":
+                session.deactivate()
+                self.close_session(session_id)
+                if websocket:
+                    await websocket.send_json({"type": "cancelled", "session_id": session_id})
+            else:
+                if websocket:
+                    await websocket.send_json({"type": "error", "message": "invalid message type"})
+        except Exception:
+            if websocket:
+                await websocket.send_json({"type": "error", "message": "processing error"})
 
 class WebSocketManager:
     """

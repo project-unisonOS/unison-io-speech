@@ -1,7 +1,7 @@
 # WebSocket Streaming API - io-speech
 
 **Version**: 1.0  
-**Endpoint**: `ws://localhost:8083/stream`  
+**Endpoint**: `ws://localhost:8084/stream`  
 **Protocol**: WebSocket with JSON messages  
 **Audio Format**: PCM16, 16kHz, mono
 
@@ -49,7 +49,7 @@ ws.onclose = () => {
 
 ### Connection Parameters
 
-- **URL**: `ws://localhost:8083/stream`
+- **URL**: `ws://localhost:8084/stream`
 - **Protocol**: WebSocket (RFC 6455)
 - **Subprotocol**: None
 - **Headers**: Standard WebSocket headers
@@ -178,7 +178,7 @@ Transcription result (partial or final).
 **Fields**:
 - `type` (string): Always `"transcript"`
 - `text` (string): Transcribed text
-- `is_final` (boolean): 
+- `is_final` (boolean):
   - `true` - Final transcript (speech ended)
   - `false` - Partial transcript (speech ongoing)
 - `confidence` (float): Confidence score (0.0 to 1.0)

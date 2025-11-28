@@ -51,7 +51,7 @@ They are **complementary**, not competing schemas.
 
 **Purpose**: Service-to-service communication across the entire Unison platform
 
-**Location**: `unison-platform/specs/unison-spec/unison_spec/events.py`
+**Location**: `unison-docs/dev/specs/schemas/event-envelope.md` (schema) and `unison-common` envelope helpers
 
 **Event Types**:
 ```python

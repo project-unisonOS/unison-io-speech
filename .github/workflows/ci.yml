@@ -33,5 +33,6 @@ jobs:
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           OTEL_SDK_DISABLED: "true"
+          PYTHONPATH: "src"
         run: |
           pytest -p pytest_rerunfailures -q --maxfail=1 --durations=15 --reruns 1

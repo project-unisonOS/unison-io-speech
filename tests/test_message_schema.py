@@ -1,4 +1,4 @@
-from src.message_schema import (
+from message_schema import (
     AudioInputMessage,
     ControlMessage,
     create_transcript_message,

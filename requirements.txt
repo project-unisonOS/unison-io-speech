@@ -6,3 +6,6 @@ numpy==1.26.4
 python-multipart==0.0.9
 
 # unison-common package (local install)
+# test-only deps
+pytest==9.0.1
+pytest-rerunfailures==14.0

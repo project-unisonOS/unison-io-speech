@@ -30,5 +30,8 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pytest pytest-asyncio pytest-rerunfailures
       - name: Run tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          OTEL_SDK_DISABLED: "true"
         run: |
           pytest -q --maxfail=1 --durations=15 --reruns 1

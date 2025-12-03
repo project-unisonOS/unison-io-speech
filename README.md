@@ -40,3 +40,7 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -c ../constraints.txt -r requirements.txt
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OTEL_SDK_DISABLED=true python -m pytest
 ```
+
+## Docs
+
+Full docs at https://project-unisonos.github.io

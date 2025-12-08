@@ -33,6 +33,7 @@ Optional (dev-mode) — stubbed speech gateway; used in devstack but not require
 
 - Intended for Developer Mode; stub implementations.
 - Real STT/TTS will be plugged in later.
+- Use renderer for expressive speech outputs; if an action would change physical hardware state (relays, smart speakers, etc.), route it through `unison-actuation` using the Action Envelope (`unison-docs/dev/specs/action-envelope.md`).
 
 ## Testing
 ```bash

@@ -1,6 +1,8 @@
 # unison-io-speech
 
-Multimodal I/O service for speech: speech-to-text and text-to-speech stubs. Emits EventEnvelopes to the Orchestrator.
+Multimodal I/O service for speech: speech-to-text and text-to-speech stubs plus a WebSocket streaming façade.
+
+Phase 4: streams partial transcripts to the renderer and forwards final transcripts to the orchestrator as `InputEventEnvelope` (`POST /input`).
 
 ## Status
 Optional (dev-mode) — stubbed speech gateway; used in devstack but not required for headless tests.
@@ -33,6 +35,7 @@ Optional (dev-mode) — stubbed speech gateway; used in devstack but not require
 
 - Intended for Developer Mode; stub implementations.
 - Real STT/TTS will be plugged in later.
+- WebSocket sessions derive a `trace_id` from incoming headers (`x-trace-id`/`x-request-id`/`traceparent`) or generate one; forwarded downstream for correlation.
 - Use renderer for expressive speech outputs; if an action would change physical hardware state (relays, smart speakers, etc.), route it through `unison-actuation` using the Action Envelope (`unison-docs/dev/specs/action-envelope.md`).
 
 ## Testing

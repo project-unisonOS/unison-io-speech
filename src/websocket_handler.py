@@ -8,9 +8,14 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import time
 from typing import Optional, Any
 from fastapi import WebSocket, WebSocketDisconnect
 from datetime import datetime
+import uuid
+
+import httpx
 
 from .message_schema import (
     parse_client_message,
@@ -26,6 +31,60 @@ from .vad import VoiceActivityDetector, VADConfig
 
 logger = logging.getLogger(__name__)
 
+_ORCH_HOST = os.getenv("UNISON_ORCH_HOST", "orchestrator")
+_ORCH_PORT = os.getenv("UNISON_ORCH_PORT", "8080")
+_ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", f"http://{_ORCH_HOST}:{_ORCH_PORT}")
+_ORCHESTRATOR_INPUT_PATH = os.getenv("UNISON_ORCHESTRATOR_INPUT_PATH", "/input")
+
+_RENDERER_URL = os.getenv("EXPERIENCE_RENDERER_URL", os.getenv("UNISON_RENDERER_URL", "http://experience-renderer:8082"))
+
+_FORWARD_FINAL = os.getenv("UNISON_SPEECH_FORWARD_FINAL_TO_ORCHESTRATOR", "true").lower() in {"1", "true", "yes", "on"}
+_STREAM_PARTIAL = os.getenv("UNISON_SPEECH_STREAM_PARTIAL_TO_RENDERER", "true").lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_trace_id(headers: Any) -> str:
+    try:
+        x_trace = headers.get("x-trace-id") or headers.get("X-Trace-Id")
+        if isinstance(x_trace, str) and x_trace.strip():
+            return x_trace.strip()
+        x_req = headers.get("x-request-id") or headers.get("X-Request-Id")
+        if isinstance(x_req, str) and x_req.strip():
+            return x_req.strip()
+        tp = headers.get("traceparent") or headers.get("Traceparent")
+        if isinstance(tp, str):
+            parts = tp.split("-")
+            if len(parts) >= 3 and parts[1]:
+                return parts[1]
+    except Exception:
+        pass
+    return uuid.uuid4().hex
+
+
+def _format_traceparent(trace_id_hex: str, span_id_hex16: str = "0000000000000001") -> str:
+    trace_id = (trace_id_hex or uuid.uuid4().hex).replace("-", "")[:32].ljust(32, "0")
+    span_id = (span_id_hex16 or uuid.uuid4().hex[:16])[:16].ljust(16, "0")
+    return f"00-{trace_id}-{span_id}-01"
+
+
+def _service_auth_header() -> dict[str, str]:
+    try:
+        from jose import jwt
+
+        secret = os.getenv("UNISON_SERVICE_SECRET", "default-service-secret")
+        now = int(time.time())
+        payload = {
+            "sub": "service-io-speech",
+            "type": "service",
+            "roles": ["service"],
+            "iat": now,
+            "exp": now + 3600,
+            "jti": f"io_speech_{now}",
+        }
+        token = jwt.encode(payload, secret, algorithm="HS256")
+        return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        return {}
+
 
 class StreamingSession:
     """
@@ -34,9 +93,18 @@ class StreamingSession:
     Handles audio input, VAD, transcription, and barge-in.
     """
     
-    def __init__(self, session_id: str, websocket: Optional[WebSocket] = None):
+    def __init__(
+        self,
+        session_id: str,
+        websocket: Optional[WebSocket] = None,
+        *,
+        trace_id: Optional[str] = None,
+        person_id: Optional[str] = None,
+    ):
         self.websocket = websocket
         self.session_id = session_id
+        self.trace_id = trace_id or uuid.uuid4().hex
+        self.person_id = person_id
         self.vad = VoiceActivityDetector(VADConfig())
         self.is_active = True
         self.is_listening = False
@@ -53,6 +121,11 @@ class StreamingSession:
         """Send message to client"""
         if not self.websocket:
             return
+        # Provide correlation fields for clients; safe for older clients to ignore.
+        message.setdefault("trace_id", self.trace_id)
+        message.setdefault("session_id", self.session_id)
+        if self.person_id:
+            message.setdefault("person_id", self.person_id)
         try:
             await self.websocket.send_json(message)
         except Exception as e:
@@ -138,6 +211,8 @@ class StreamingSession:
         
         await self.send_message(transcript_msg.dict())
         logger.debug(f"Session {self.session_id}: Sent partial transcript")
+        if _STREAM_PARTIAL:
+            await self._emit_partial_to_renderer(transcript_text)
     
     async def generate_final_transcript(self):
         """Generate and send final transcript"""
@@ -159,9 +234,61 @@ class StreamingSession:
         
         await self.send_message(transcript_msg.dict())
         logger.info(f"Session {self.session_id}: Sent final transcript ({len(transcript_text)} chars)")
+        if _FORWARD_FINAL:
+            await self._forward_final_to_orchestrator(transcript_text, confidence=0.95)
         
         # Clear buffer
         self.audio_buffer.clear()
+
+    async def _emit_partial_to_renderer(self, transcript_text: str) -> None:
+        if not _RENDERER_URL:
+            return
+        envelope = {
+            "type": "outcome.reflected",
+            "payload": {"text": transcript_text, "person_id": self.person_id, "session_id": self.session_id},
+            "urgency": "low",
+            "ts": time.time(),
+            "trace_id": self.trace_id,
+            "session_id": self.session_id,
+            "person_id": self.person_id,
+        }
+        headers = {
+            "x-request-id": self.trace_id,
+            "x-trace-id": self.trace_id,
+            "traceparent": _format_traceparent(self.trace_id),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                await client.post(f"{_RENDERER_URL.rstrip('/')}/events", json=envelope, headers=headers)
+        except Exception:
+            pass
+
+    async def _forward_final_to_orchestrator(self, transcript_text: str, *, confidence: float) -> None:
+        if not _ORCHESTRATOR_URL:
+            return
+        body = {
+            "schema_version": "input-event.v1",
+            "event_id": str(uuid.uuid4()),
+            "trace_id": self.trace_id,
+            "ts_unix_ms": int(datetime.now().timestamp() * 1000),
+            "source": "io-speech",
+            "modality": "speech",
+            "payload": {"transcript": transcript_text, "text": transcript_text, "confidence": confidence, "is_final": True},
+            "person_id": self.person_id,
+            "session_id": self.session_id,
+            "auth": {},
+        }
+        headers = {
+            "x-request-id": self.trace_id,
+            "x-trace-id": self.trace_id,
+            "traceparent": _format_traceparent(self.trace_id),
+        }
+        headers.update(_service_auth_header())
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                await client.post(f"{_ORCHESTRATOR_URL.rstrip('/')}{_ORCHESTRATOR_INPUT_PATH}", json=body, headers=headers)
+        except Exception:
+            pass
     
     async def handle_control(self, message: ControlMessage):
         """Handle control commands from client"""
@@ -308,7 +435,9 @@ class WebSocketManager:
         """Create a new streaming session"""
         self.session_counter += 1
         session_id = f"session-{self.session_counter}"
-        session = StreamingSession(websocket, session_id)
+        trace_id = _extract_trace_id(websocket.headers)
+        person_id = websocket.query_params.get("person_id") if hasattr(websocket, "query_params") else None
+        session = StreamingSession(session_id, websocket, trace_id=trace_id, person_id=person_id)
         self.sessions[session_id] = session
         logger.info(f"Created session {session_id} (total: {len(self.sessions)})")
         return session

@@ -39,6 +39,8 @@ _ORCHESTRATOR_INPUT_PATH = os.getenv("UNISON_ORCHESTRATOR_INPUT_PATH", "/input")
 _RENDERER_URL = os.getenv("EXPERIENCE_RENDERER_URL", os.getenv("UNISON_RENDERER_URL", "http://experience-renderer:8082"))
 
 _FORWARD_FINAL = os.getenv("UNISON_SPEECH_FORWARD_FINAL_TO_ORCHESTRATOR", "true").lower() in {"1", "true", "yes", "on"}
+_FORWARD_PARTIAL = os.getenv("UNISON_SPEECH_FORWARD_PARTIAL_TO_ORCHESTRATOR", "true").lower() in {"1", "true", "yes", "on"}
+_FORWARD_VAD = os.getenv("UNISON_SPEECH_FORWARD_VAD_TO_ORCHESTRATOR", "true").lower() in {"1", "true", "yes", "on"}
 _STREAM_PARTIAL = os.getenv("UNISON_SPEECH_STREAM_PARTIAL_TO_RENDERER", "true").lower() in {"1", "true", "yes", "on"}
 
 
@@ -113,6 +115,9 @@ class StreamingSession:
         self.transcript_buffer: str = ""
         self.sequence_counter = 0
         self.tts_sequence: Optional[int] = None
+        self._speech_started_at_ms: Optional[int] = None
+        self._min_utterance_ms: int = 0
+        self._max_utterance_ms: int = 0
         self.start_time = datetime.now()
         
         logger.info(f"Session {session_id} created")
@@ -164,9 +169,12 @@ class StreamingSession:
             for event in vad_events:
                 vad_msg = create_vad_event(event, energy=self.vad.get_average_energy())
                 await self.send_message(vad_msg.dict())
+                if _FORWARD_VAD:
+                    await self._forward_speechio_event("vad_start" if event == "speech_start" else "vad_end")
                 
                 if event == "speech_start":
                     self.is_listening = True
+                    self._speech_started_at_ms = int(time.time() * 1000)
                     # Check for barge-in
                     if self.is_speaking and self.tts_sequence is not None:
                         await self.handle_barge_in()
@@ -177,6 +185,15 @@ class StreamingSession:
                 
                 elif event == "speech_end":
                     self.is_listening = False
+                    started = self._speech_started_at_ms or int(time.time() * 1000)
+                    duration_ms = int(time.time() * 1000) - started
+                    self._speech_started_at_ms = None
+                    if self._min_utterance_ms > 0 and duration_ms < self._min_utterance_ms:
+                        # Too short; ignore and reset buffers.
+                        self.audio_buffer = b""
+                        status_msg = create_status_message("listening")
+                        await self.send_message(status_msg.dict())
+                        continue
                     # Generate final transcript
                     await self.generate_final_transcript()
                     
@@ -186,6 +203,22 @@ class StreamingSession:
             
             # Generate partial transcripts during speech
             if self.vad.is_speaking() and len(self.audio_buffer) > 16000:  # ~1 second
+                # Max-utterance enforcement (best-effort): force-finalize even without VAD end.
+                if self._max_utterance_ms > 0 and self._speech_started_at_ms is not None:
+                    elapsed = int(time.time() * 1000) - self._speech_started_at_ms
+                    if elapsed >= self._max_utterance_ms:
+                        self.is_listening = False
+                        self._speech_started_at_ms = None
+                        # Emit a synthetic speech_end, then finalize.
+                        vad_msg = create_vad_event("speech_end", energy=self.vad.get_average_energy())
+                        await self.send_message(vad_msg.dict())
+                        if _FORWARD_VAD:
+                            await self._forward_speechio_event("vad_end")
+                        await self.generate_final_transcript()
+                        status_msg = create_status_message("processing")
+                        await self.send_message(status_msg.dict())
+                        self.vad.reset()
+                        return
                 await self.generate_partial_transcript()
         
         except Exception as e:
@@ -213,6 +246,8 @@ class StreamingSession:
         logger.debug(f"Session {self.session_id}: Sent partial transcript")
         if _STREAM_PARTIAL:
             await self._emit_partial_to_renderer(transcript_text)
+        if _FORWARD_PARTIAL:
+            await self._forward_speechio_event("partial", text=transcript_text, confidence=0.75)
     
     async def generate_final_transcript(self):
         """Generate and send final transcript"""
@@ -235,10 +270,10 @@ class StreamingSession:
         await self.send_message(transcript_msg.dict())
         logger.info(f"Session {self.session_id}: Sent final transcript ({len(transcript_text)} chars)")
         if _FORWARD_FINAL:
-            await self._forward_final_to_orchestrator(transcript_text, confidence=0.95)
+            await self._forward_speechio_event("final", text=transcript_text, confidence=0.95)
         
         # Clear buffer
-        self.audio_buffer.clear()
+        self.audio_buffer = b""
 
     async def _emit_partial_to_renderer(self, transcript_text: str) -> None:
         if not _RENDERER_URL:
@@ -263,9 +298,18 @@ class StreamingSession:
         except Exception:
             pass
 
-    async def _forward_final_to_orchestrator(self, transcript_text: str, *, confidence: float) -> None:
+    async def _forward_speechio_event(self, type: str, *, text: str | None = None, confidence: float | None = None) -> None:
         if not _ORCHESTRATOR_URL:
             return
+        payload: dict[str, Any] = {"speechio": {"type": type}}
+        if isinstance(text, str) and text.strip():
+            payload["speechio"]["text"] = text.strip()
+            payload["text"] = text.strip()
+            payload["transcript"] = text.strip()
+        if isinstance(confidence, (int, float)):
+            payload["speechio"]["confidence"] = float(confidence)
+        payload["speechio"]["engine"] = "io-speech.stub"
+        payload["speechio"]["profile"] = os.getenv("UNISON_SPEECH_DEFAULT_ASR_PROFILE", "fast")
         body = {
             "schema_version": "input-event.v1",
             "event_id": str(uuid.uuid4()),
@@ -273,7 +317,7 @@ class StreamingSession:
             "ts_unix_ms": int(datetime.now().timestamp() * 1000),
             "source": "io-speech",
             "modality": "speech",
-            "payload": {"transcript": transcript_text, "text": transcript_text, "confidence": confidence, "is_final": True},
+            "payload": payload,
             "person_id": self.person_id,
             "session_id": self.session_id,
             "auth": {},
@@ -297,6 +341,20 @@ class StreamingSession:
         if action == "start_listening":
             self.is_listening = True
             self.vad.reset()
+            self._speech_started_at_ms = None
+            # Endpointing policy (best-effort):
+            # - hangover_ms maps to VAD silence duration
+            # - min/max are enforced at the session level
+            if isinstance(message.endpointing, dict):
+                hangover = message.endpointing.get("hangover_ms")
+                min_utt = message.endpointing.get("min_utterance_ms")
+                max_utt = message.endpointing.get("max_utterance_ms")
+                if isinstance(hangover, int) and hangover >= 0:
+                    self.vad.config.silence_duration_ms = hangover
+                if isinstance(min_utt, int) and min_utt >= 0:
+                    self._min_utterance_ms = min_utt
+                if isinstance(max_utt, int) and max_utt >= 0:
+                    self._max_utterance_ms = max_utt
             status_msg = create_status_message("listening")
             await self.send_message(status_msg.dict())
             logger.debug(f"Session {self.session_id}: Started listening")

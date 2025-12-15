@@ -29,6 +29,11 @@ class ControlMessage(BaseModel):
         ..., description="Control action to perform"
     )
     timestamp: Optional[int] = Field(None, description="Client timestamp in milliseconds")
+    endpointing: Optional[dict] = Field(
+        default=None,
+        description="Optional endpointing policy: {hangover_ms, min_utterance_ms, max_utterance_ms}",
+    )
+    asr_profile: Optional[Literal["fast", "accurate"]] = Field(default=None)
 
 
 # Union type for all client messages

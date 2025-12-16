@@ -2,8 +2,8 @@ from fastapi import FastAPI, Request, Body, WebSocket
 import uvicorn
 import logging
 import json
+import os
 import time
-import base64
 from typing import Any, Dict
 from unison_common.logging import configure_logging, log_json
 from unison_common.tracing_middleware import TracingMiddleware
@@ -16,6 +16,7 @@ from collections import defaultdict
 
 # Import WebSocket handler
 from .websocket_handler import handle_websocket_stream, get_active_sessions, get_session_count
+from .engines import get_asr_engine, get_tts_engine
 
 app = FastAPI(title="unison-io-speech")
 app.add_middleware(TracingMiddleware, service_name="unison-io-speech")
@@ -23,6 +24,7 @@ if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
 
 logger = configure_logging("unison-io-speech")
+_ENGINE_MODE = os.getenv("UNISON_SPEECH_ENGINE_MODE", "local").strip().lower()
 
 # P0.3: Initialize tracing and instrument FastAPI/httpx
 initialize_tracing()
@@ -63,8 +65,18 @@ def metrics():
 @app.get("/ready")
 def ready(request: Request):
     event_id = request.headers.get("X-Event-ID")
-    log_json(logging.INFO, "ready", service="unison-io-speech", event_id=event_id, ready=True)
-    return {"ready": True}
+    ready_ok = True
+    detail = "ok"
+    if os.getenv("UNISON_SPEECH_READY_CHECK", "true").lower() in {"1", "true", "yes", "on"}:
+        try:
+            # Force model resolution (without loading weights) for a product-grade failure mode.
+            _ = get_asr_engine()
+            _ = get_tts_engine()
+        except Exception as exc:
+            ready_ok = False
+            detail = str(exc)
+    log_json(logging.INFO, "ready", service="unison-io-speech", event_id=event_id, ready=ready_ok, detail=detail)
+    return {"ready": ready_ok, "detail": detail}
 
 @app.post("/speech/stt")
 def speech_to_text(request: Request, body: Dict[str, Any] = Body(...)):
@@ -80,8 +92,17 @@ def speech_to_text(request: Request, body: Dict[str, Any] = Body(...)):
     session_id = body.get("session_id")
     if not isinstance(audio_b64, str):
         return {"ok": False, "error": "missing or invalid 'audio' field (base64 string)", "event_id": event_id}
-    # MVP: ignore audio, return a placeholder transcript
-    transcript = "This is a placeholder transcript from speech-to-text."
+    profile = body.get("profile") or os.getenv("UNISON_SPEECH_DEFAULT_ASR_PROFILE", "fast")
+    if profile not in {"fast", "accurate"}:
+        profile = "fast"
+    if _ENGINE_MODE == "stub":
+        transcript, confidence = "stub transcript", 0.5
+    else:
+        try:
+            engine = get_asr_engine()
+            transcript, confidence = engine.transcribe_audio_b64(audio_b64=audio_b64, profile=profile)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "event_id": event_id}
     log_json(
         logging.INFO,
         "stt",
@@ -94,6 +115,9 @@ def speech_to_text(request: Request, body: Dict[str, Any] = Body(...)):
     return {
         "ok": True,
         "transcript": transcript,
+        "confidence": confidence,
+        "engine": "faster-whisper",
+        "profile": profile,
         "event_id": event_id,
         "person_id": person_id,
         "session_id": session_id,
@@ -115,9 +139,18 @@ def text_to_speech(request: Request, body: Dict[str, Any] = Body(...)):
     session_id = body.get("session_id")
     if not isinstance(text, str) or not text:
         return {"ok": False, "error": "missing or invalid 'text' field", "event_id": event_id}
-    # MVP: return a placeholder base64-encoded WAV (tiny silence)
-    silence_wav = "UklGRigAAABXQVZFZm10IBAAAAAAQAEAAEAfAAAQAQABAAgAZGF0YQQAAAA="
-    audio_url = f"data:audio/wav;base64,{silence_wav}"
+    profile = body.get("profile") or os.getenv("UNISON_SPEECH_DEFAULT_TTS_PROFILE", "lightweight")
+    if profile not in {"lightweight", "natural"}:
+        profile = "lightweight"
+    if _ENGINE_MODE == "stub":
+        silence_wav = "UklGRigAAABXQVZFZm10IBAAAAAAQAEAAEAfAAAQAQABAAgAZGF0YQQAAAA="
+        audio_url = f"data:audio/wav;base64,{silence_wav}"
+    else:
+        try:
+            tts = get_tts_engine()
+            audio_url = tts.synthesize_data_url(text=text, profile=profile)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "event_id": event_id}
     log_json(
         logging.INFO,
         "tts",
@@ -130,6 +163,8 @@ def text_to_speech(request: Request, body: Dict[str, Any] = Body(...)):
     return {
         "ok": True,
         "audio_url": audio_url,
+        "engine": "piper",
+        "profile": profile,
         "event_id": event_id,
         "person_id": person_id,
         "session_id": session_id,

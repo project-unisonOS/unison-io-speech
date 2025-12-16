@@ -41,7 +41,7 @@ def test_stt_placeholder():
     j = r.json()
     assert j.get("ok") is True
     assert isinstance(j.get("transcript"), str)
-    assert "placeholder" in j.get("transcript", "").lower()
+    assert len(j.get("transcript", "").strip()) > 0
 
 
 def test_tts_missing_text():

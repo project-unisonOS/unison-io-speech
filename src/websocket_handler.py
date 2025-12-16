@@ -28,6 +28,7 @@ from .message_schema import (
     ControlMessage,
 )
 from .vad import VoiceActivityDetector, VADConfig
+from .engines import get_asr_engine
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ class StreamingSession:
         self.transcript_buffer: str = ""
         self.sequence_counter = 0
         self.tts_sequence: Optional[int] = None
+        self.asr_profile: str = os.getenv("UNISON_SPEECH_DEFAULT_ASR_PROFILE", "fast")
         self._speech_started_at_ms: Optional[int] = None
         self._min_utterance_ms: int = 0
         self._max_utterance_ms: int = 0
@@ -231,15 +233,40 @@ class StreamingSession:
     
     async def generate_partial_transcript(self):
         """Generate and send partial transcript"""
-        # Stub implementation - returns placeholder text
-        # In production, this would call a streaming STT service
+        if len(self.audio_buffer) == 0:
+            return
+        if os.getenv("UNISON_SPEECH_ENGINE_MODE", "local").strip().lower() == "stub":
+            transcript_text = f"Partial transcript... (buffer size: {len(self.audio_buffer)} bytes)"
+            transcript_msg = create_transcript_message(text=transcript_text, is_final=False, confidence=0.75)
+            await self.send_message(transcript_msg.dict())
+            logger.debug(f"Session {self.session_id}: Sent partial transcript (stub)")
+            if _STREAM_PARTIAL:
+                await self._emit_partial_to_renderer(transcript_text)
+            if _FORWARD_PARTIAL:
+                await self._forward_speechio_event("partial", text=transcript_text, confidence=0.75)
+            return
         
-        transcript_text = f"Partial transcript... (buffer size: {len(self.audio_buffer)} bytes)"
+        # Chunk-level partial: transcribe a small trailing window (keeps latency bounded).
+        window_ms = int(os.getenv("UNISON_ASR_PARTIAL_WINDOW_MS", "2500"))
+        window_bytes = int(16000 * 2 * (window_ms / 1000.0))
+        audio_bytes = self.audio_buffer[-window_bytes:] if window_bytes > 0 else self.audio_buffer
+        audio_bytes = audio_bytes[: len(audio_bytes) - (len(audio_bytes) % 2)]
+        
+        transcript_text, confidence = await asyncio.to_thread(
+            get_asr_engine().transcribe_pcm16,
+            audio_pcm16=audio_bytes,
+            sample_rate_hz=16000,
+            profile=self.asr_profile,
+            language="en",
+        )
+        transcript_text = (transcript_text or "").strip()
+        if not transcript_text:
+            return
         
         transcript_msg = create_transcript_message(
             text=transcript_text,
             is_final=False,
-            confidence=0.75
+            confidence=confidence
         )
         
         await self.send_message(transcript_msg.dict())
@@ -247,30 +274,46 @@ class StreamingSession:
         if _STREAM_PARTIAL:
             await self._emit_partial_to_renderer(transcript_text)
         if _FORWARD_PARTIAL:
-            await self._forward_speechio_event("partial", text=transcript_text, confidence=0.75)
+            await self._forward_speechio_event("partial", text=transcript_text, confidence=confidence)
     
     async def generate_final_transcript(self):
         """Generate and send final transcript"""
-        # Stub implementation - returns placeholder text
-        # In production, this would call a final STT service
-        
         if len(self.audio_buffer) == 0:
             return
+        if os.getenv("UNISON_SPEECH_ENGINE_MODE", "local").strip().lower() == "stub":
+            duration_sec = len(self.audio_buffer) / (16000 * 2)
+            transcript_text = f"This is a placeholder final transcript for {duration_sec:.1f}s of audio."
+            transcript_msg = create_transcript_message(text=transcript_text, is_final=True, confidence=0.95)
+            await self.send_message(transcript_msg.dict())
+            logger.info(f"Session {self.session_id}: Sent final transcript (stub)")
+            if _FORWARD_FINAL:
+                await self._forward_speechio_event("final", text=transcript_text, confidence=0.95)
+            self.audio_buffer = b""
+            return
         
-        # Simulate transcription based on audio length
-        duration_sec = len(self.audio_buffer) / (16000 * 2)  # 16kHz, 16-bit
-        transcript_text = f"This is a placeholder final transcript for {duration_sec:.1f}s of audio."
+        audio_bytes = self.audio_buffer[: len(self.audio_buffer) - (len(self.audio_buffer) % 2)]
+        transcript_text, confidence = await asyncio.to_thread(
+            get_asr_engine().transcribe_pcm16,
+            audio_pcm16=audio_bytes,
+            sample_rate_hz=16000,
+            profile=self.asr_profile,
+            language="en",
+        )
+        transcript_text = (transcript_text or "").strip()
+        if not transcript_text:
+            self.audio_buffer = b""
+            return
         
         transcript_msg = create_transcript_message(
             text=transcript_text,
             is_final=True,
-            confidence=0.95
+            confidence=confidence
         )
         
         await self.send_message(transcript_msg.dict())
         logger.info(f"Session {self.session_id}: Sent final transcript ({len(transcript_text)} chars)")
         if _FORWARD_FINAL:
-            await self._forward_speechio_event("final", text=transcript_text, confidence=0.95)
+            await self._forward_speechio_event("final", text=transcript_text, confidence=confidence)
         
         # Clear buffer
         self.audio_buffer = b""
@@ -308,8 +351,8 @@ class StreamingSession:
             payload["transcript"] = text.strip()
         if isinstance(confidence, (int, float)):
             payload["speechio"]["confidence"] = float(confidence)
-        payload["speechio"]["engine"] = "io-speech.stub"
-        payload["speechio"]["profile"] = os.getenv("UNISON_SPEECH_DEFAULT_ASR_PROFILE", "fast")
+        payload["speechio"]["engine"] = "io-speech.stub" if os.getenv("UNISON_SPEECH_ENGINE_MODE", "local").strip().lower() == "stub" else "faster-whisper"
+        payload["speechio"]["profile"] = self.asr_profile
         body = {
             "schema_version": "input-event.v1",
             "event_id": str(uuid.uuid4()),
@@ -342,6 +385,8 @@ class StreamingSession:
             self.is_listening = True
             self.vad.reset()
             self._speech_started_at_ms = None
+            if message.asr_profile in {"fast", "accurate"}:
+                self.asr_profile = message.asr_profile
             # Endpointing policy (best-effort):
             # - hangover_ms maps to VAD silence duration
             # - min/max are enforced at the session level

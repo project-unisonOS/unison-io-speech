@@ -25,7 +25,7 @@ class AudioInputMessage(BaseModel):
 class ControlMessage(BaseModel):
     """Control commands from client"""
     type: Literal["control"] = "control"
-    action: Literal["start_listening", "stop_listening", "cancel_tts"] = Field(
+    action: Literal["start_listening", "stop_listening", "cancel_tts", "set_output_modes"] = Field(
         ..., description="Control action to perform"
     )
     timestamp: Optional[int] = Field(None, description="Client timestamp in milliseconds")
@@ -34,6 +34,10 @@ class ControlMessage(BaseModel):
         description="Optional endpointing policy: {hangover_ms, min_utterance_ms, max_utterance_ms}",
     )
     asr_profile: Optional[Literal["fast", "accurate"]] = Field(default=None)
+    output_modes: Optional[list[Literal["speech", "captions", "visual"]]] = Field(
+        default=None,
+        description="Requested equivalent output modes; captions remain available when speech is disabled",
+    )
 
 
 # Union type for all client messages
@@ -78,6 +82,16 @@ class BargeInMessage(BaseModel):
     type: Literal["barge_in"] = "barge_in"
     cancelled_sequence: int = Field(..., description="Sequence number of cancelled TTS")
     timestamp: int = Field(..., description="Server timestamp in milliseconds")
+    reason: Literal["voice", "control"] = "voice"
+
+
+class ModalityStatusMessage(BaseModel):
+    """Negotiated output modes and deterministic fallback."""
+    type: Literal["modality_status"] = "modality_status"
+    active: list[Literal["speech", "captions", "visual"]]
+    fallback: Literal["captions", "visual"]
+    semantic_actions_preserved: Literal[True] = True
+    timestamp: int = Field(..., description="Server timestamp in milliseconds")
 
 
 class ErrorMessage(BaseModel):
@@ -103,6 +117,7 @@ ServerMessage = Union[
     VADEventMessage,
     AudioOutputMessage,
     BargeInMessage,
+    ModalityStatusMessage,
     ErrorMessage,
     StatusMessage,
 ]
@@ -152,11 +167,27 @@ def create_vad_event(event: Literal["speech_start", "speech_end"], energy: Optio
     )
 
 
-def create_barge_in_message(cancelled_sequence: int) -> BargeInMessage:
+def create_barge_in_message(
+    cancelled_sequence: int,
+    reason: Literal["voice", "control"] = "voice",
+) -> BargeInMessage:
     """Create a barge-in message"""
     return BargeInMessage(
         cancelled_sequence=cancelled_sequence,
+        reason=reason,
         timestamp=get_timestamp_ms()
+    )
+
+
+def create_modality_status(
+    active: list[Literal["speech", "captions", "visual"]],
+) -> ModalityStatusMessage:
+    normalized = list(dict.fromkeys(active))
+    fallback: Literal["captions", "visual"] = "captions" if "captions" in normalized else "visual"
+    return ModalityStatusMessage(
+        active=normalized,
+        fallback=fallback,
+        timestamp=get_timestamp_ms(),
     )
 
 

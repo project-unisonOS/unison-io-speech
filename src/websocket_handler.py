@@ -22,6 +22,7 @@ from .message_schema import (
     create_transcript_message,
     create_vad_event,
     create_barge_in_message,
+    create_modality_status,
     create_error_message,
     create_status_message,
     AudioInputMessage,
@@ -117,6 +118,7 @@ class StreamingSession:
         self.sequence_counter = 0
         self.tts_sequence: Optional[int] = None
         self.asr_profile: str = os.getenv("UNISON_SPEECH_DEFAULT_ASR_PROFILE", "fast")
+        self.output_modes: list[str] = ["speech", "captions"]
         self._speech_started_at_ms: Optional[int] = None
         self._min_utterance_ms: int = 0
         self._max_utterance_ms: int = 0
@@ -415,17 +417,22 @@ class StreamingSession:
         
         elif action == "cancel_tts":
             if self.is_speaking and self.tts_sequence is not None:
-                await self.handle_barge_in()
+                await self.handle_barge_in(reason="control")
             logger.debug(f"Session {self.session_id}: TTS cancelled by user")
+
+        elif action == "set_output_modes":
+            requested = list(dict.fromkeys(message.output_modes or []))
+            self.output_modes = requested or ["captions"]
+            await self.send_message(create_modality_status(self.output_modes).model_dump())
     
-    async def handle_barge_in(self):
+    async def handle_barge_in(self, *, reason: str = "voice"):
         """Handle barge-in (user interrupts TTS)"""
         if self.tts_sequence is None:
             return
         
         # Send barge-in notification
-        barge_in_msg = create_barge_in_message(self.tts_sequence)
-        await self.send_message(barge_in_msg.dict())
+        barge_in_msg = create_barge_in_message(self.tts_sequence, reason=reason)
+        await self.send_message(barge_in_msg.model_dump())
         
         # Reset TTS state
         self.is_speaking = False
@@ -434,7 +441,7 @@ class StreamingSession:
         # Resume listening
         self.is_listening = True
         status_msg = create_status_message("listening")
-        await self.send_message(status_msg.dict())
+        await self.send_message(status_msg.model_dump())
         
         logger.info(f"Session {self.session_id}: Barge-in detected, TTS cancelled")
     
@@ -443,7 +450,7 @@ class StreamingSession:
         self.is_speaking = True
         self.tts_sequence = sequence
         status_msg = create_status_message("speaking")
-        await self.send_message(status_msg.dict())
+        await self.send_message(status_msg.model_dump())
         logger.debug(f"Session {self.session_id}: TTS playback started (seq={sequence})")
     
     async def end_tts_playback(self):
@@ -463,6 +470,7 @@ class StreamingSession:
             "vad_state": self.vad.get_state(),
             "buffer_size": len(self.audio_buffer),
             "uptime_seconds": (datetime.now() - self.start_time).total_seconds(),
+            "output_modes": list(self.output_modes),
         }
 
 # Lightweight handler used by unit tests to manage sessions without FastAPI.
